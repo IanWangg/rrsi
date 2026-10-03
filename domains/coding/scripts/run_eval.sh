@@ -23,10 +23,11 @@ REPO="${RRSI_CODING_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 JOB_NAME="${1:?job name required}"
 DATASET="${2:-terminal-bench/terminal-bench-2-1}"
 N_ATTEMPTS="${3:-1}"
-N_CONCURRENT="${4:-4}"
+N_CONCURRENT="${4:-1}"
 shift $(( $# > 4 ? 4 : $# ))
 
-JOBS_DIR="$REPO/runs/jobs"
+MAIN="${RRSI_REPO_ROOT:-$(cd "$REPO/../.." && pwd)}"
+JOBS_DIR="$MAIN/runs/coding/jobs"
 EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,19 +36,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-export PATH="$REPO/bin:$PATH"            # docker -> sudo -E docker shim
-export PYTHONPATH="$(cd "$REPO/../.." && pwd)/third_party"   # so --agent harbor_terminus2:AgentHarness resolves
-export VERTEXAI_PROJECT="${VERTEXAI_PROJECT:?set VERTEXAI_PROJECT (GCP project for Vertex AI)}"
-export VERTEXAI_LOCATION="${VERTEXAI_LOCATION:-global}"
-VENV="${RRSI_CODING_VENV:-$REPO/.venv}"
-
-exec "$VENV/bin/harbor" run \
-  -d "$DATASET" \
-  --agent harbor_terminus2:AgentHarness \
-  -m "${MODEL:-vertex_ai/gemini-3.5-flash}" \
-  --agent-kwarg 'llm_kwargs={"num_retries": 10}' \
-  -k "$N_ATTEMPTS" \
-  -n "$N_CONCURRENT" \
-  --jobs-dir "$JOBS_DIR" \
-  --job-name "$JOB_NAME" \
-  "${EXTRA[@]}"
+export RRSI_REPO_ROOT="$MAIN"
+export RRSI_CODING_ROOT="$REPO"
+VENV="${RRSI_CODING_VENV:-$MAIN/.venv}"
+PYTHON="${RRSI_CODING_PYTHON:-$VENV/bin/python}"
+exec "$PYTHON" "$MAIN/domains/coding/harbor_entry.py" \
+  "$JOB_NAME" "$DATASET" "$N_ATTEMPTS" "$N_CONCURRENT" \
+  --jobs-dir "$JOBS_DIR" "${EXTRA[@]}"

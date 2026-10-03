@@ -12,13 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Clean up after a KILLED harbor evaluation. Force-removing the task containers alone
-# leaves their compose networks behind; after ~20 of those docker reports "all
-# predefined address pools have been fully subnetted" and EVERY later compose up
-# fails, which scores as a total collapse of the next evaluation. Always prune.
-set -u
-D="$(dirname "$0")/../bin/docker"
-n=0; for c in $($D ps -aq --filter 'name=__env'); do $D rm -f "$c" >/dev/null 2>&1 && n=$((n+1)); done
-echo "removed $n harbor task containers"
-$D network prune -f | tail -1
-echo "networks left: $($D network ls -q | wc -l)"
+# Clean up a specific interrupted job: --job JOB [--jobs-dir REPO_LOCAL_DIR].
+# Only resources belonging to that job's recorded Compose projects are removed.
+set -euo pipefail
+MAIN="${RRSI_REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+VENV="${RRSI_CODING_VENV:-$MAIN/.venv}"
+cd "$MAIN"
+exec "${RRSI_CODING_PYTHON:-$VENV/bin/python}" -m domains.coding.docker_resources "$@"

@@ -54,7 +54,8 @@ import re
 import shlex
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("RRSI_STATE_DIR", "/tmp/tbmh_state"))
+STATE_DIR = Path(os.environ.get("RRSI_STATE_DIR",
+    str(Path(__file__).resolve().parents[2] / ".runtime/state")))
 
 # crude entity-ish guard for memory writes (defence-in-depth; critic is primary)
 _LEAKY = re.compile(r"/app/|/tests?/|\.py::|expected|reference|answer\s*[:=]",
@@ -70,7 +71,8 @@ class Memory:
     dump the whole store into context."""
 
     def __init__(self, state_dir: Path | str = STATE_DIR):
-        self.dir = Path(state_dir)
+        from domains.coding.runtime import Runtime
+        self.dir = Runtime().inside(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, kind: str) -> Path:

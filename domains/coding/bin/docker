@@ -1,2 +1,9 @@
-#!/bin/sh
-exec sudo -E -n /usr/bin/docker "$@"
+#!/usr/bin/env python3
+"""Docker Desktop/Linux CLI shim; no sudo or global pruning."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from domains.coding.docker_resources import dispatch
+
+sys.exit(dispatch(sys.argv[1:]))

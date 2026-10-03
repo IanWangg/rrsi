@@ -25,7 +25,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Claude client for the three search roles (proposer, analyst, critic).
+"""Provider dispatch for the search roles (including the digester).
 
 Claude Opus 4.8 via AnthropicVertex, round-robin over the configured GCP
 projects with retry-and-rotate on failure. `cache_prefix` sends a large stable
@@ -94,10 +94,16 @@ def generate(prompt: str, system: str | None = None, max_retries: int = 6,
              max_tokens: int = MAX_TOKENS, cache_prefix: str | None = None) -> str:
     mdl = model or MODEL
     sys_prompt = (system or "") + (_JSON_SUFFIX if json_only else "")
+    from . import deepseek
+    if deepseek.is_deepseek(mdl):
+        return deepseek.generate(prompt, sys_prompt, mdl, max_tokens, json_only,
+                                 cache_prefix, max_retries)
     content = ([{"type": "text", "text": cache_prefix,
                  "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": prompt}] if cache_prefix else prompt)
     n = len(_PROJECTS)
+    if not n:
+        _client_for(0)  # fail with the configuration error, not division by zero
     start = next(_rr)
     last_err: Exception | None = None
     for attempt in range(max_retries):

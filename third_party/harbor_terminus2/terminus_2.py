@@ -23,6 +23,7 @@ from typing import Any, Literal, override
 
 from tenacity import (
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     retry_if_not_exception_type,
     stop_after_attempt,
@@ -88,6 +89,14 @@ class SubagentMetrics:
     total_completion_tokens: int = 0
     total_cached_tokens: int = 0
     total_cost_usd: float = 0.0
+
+
+def _retry_provider_error(error: Exception) -> bool:
+    from rrsi.deepseek import retryable
+    if getattr(error, "_rrsi_provider_exhausted", False):
+        return False
+    # Preserve parser/context handling; permanent HTTP failures must fail fast.
+    return retryable(error) if getattr(error, "status_code", None) is not None else True
 
 
 class Terminus2(BaseAgent):
@@ -1003,6 +1012,7 @@ so ask everything you need to know."""
             # To avoid asyncio.CancelledError retries which inherits from BaseException
             # rather than Exception
             & retry_if_exception_type(Exception)
+            & retry_if_exception(_retry_provider_error)
         ),
         reraise=True,
     )
@@ -1136,8 +1146,8 @@ so ask everything you need to know."""
             except Exception as parse_error:
                 self.logger.debug(f"Failed to parse truncated response: {parse_error}")
 
-            # Get the actual output limit for the model
-            output_limit = self._llm.get_model_output_limit()
+            # A request may set a smaller budget than the model's capability.
+            output_limit = self._llm_call_kwargs.get("max_tokens") or self._llm.get_model_output_limit()
             if output_limit is not None:
                 limit_str = f"{output_limit} tokens"
             else:

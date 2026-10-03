@@ -45,6 +45,7 @@ overridden on the command line (--T, --k, --m, --b-min, --b-max, --w,
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -88,9 +89,23 @@ def main():
     p.add_argument("--label", required=True)
     p.add_argument("--ref", default=None, help="commit/branch to evaluate (default incumbent)")
     p.add_argument("--set", default="heldout", choices=["heldout", "evolve"])
-    sub.add_parser("smoke")
+    sub.add_parser("smoke").add_argument("--working-tree", action="store_true",
+        help="test the current checkout including uncommitted changes (Coding only)")
+    sub.add_parser("preflight", help="check the Coding API, environment and Docker prerequisites")
     sub.add_parser("status")
     args = ap.parse_args()
+
+    if args.domain == "coding":
+        from domains.coding.runtime import Runtime
+        runtime = Runtime(ROOT)
+        runtime.inside(args.runs)
+        runtime.activate()
+        if args.cmd == "preflight":
+            result = runtime.preflight()
+            print(json.dumps(result, indent=2))
+            sys.exit(0 if result["ok"] else 1)
+    elif args.cmd == "preflight" or (args.cmd == "smoke" and args.working_tree):
+        ap.error("preflight and smoke --working-tree are currently Coding-only")
 
     domain = load_domain(args.domain)
     cfg = RRSIConfig.load(domain.root / "rrsi.json",
@@ -118,9 +133,26 @@ def main():
             sys.exit(f"domain {domain.name} has no {args.set} split")
         run.heldout(args.label, ids, ref=args.ref)
     elif args.cmd == "smoke":
-        run.ensure_branch()
-        wt = run.checkout("smoke", run.branch)
-        ok, detail = domain.smoke(wt, run.runs, "smoke", domain.smoke_ids())
+        if args.working_tree:
+            wt = ROOT
+        else:
+            run.ensure_branch()
+            wt = run.checkout("smoke", run.branch)
+        if args.domain == "coding":
+            import time
+            os.environ["DEEPSEEK_REASONING_EFFORT"] = "low"
+            check = runtime.preflight()
+            if not check["ok"]:
+                print(json.dumps(check, indent=2))
+                sys.exit(1)
+            job = f"smoke-{time.time_ns()}"
+        else:
+            job = "smoke"
+        ok, detail = domain.smoke(wt, run.runs, job, domain.smoke_ids())
+        if args.domain == "coding":
+            report = run.runs / "logs" / f"{job}.json"
+            report.write_text(json.dumps({"ok": ok, "job": job, **detail}, indent=2))
+            detail["report_path"] = str(report)
         print(json.dumps({"ok": ok, **detail}, indent=1))
         sys.exit(0 if ok else 1)
     elif args.cmd == "status":

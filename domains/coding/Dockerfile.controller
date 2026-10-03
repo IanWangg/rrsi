@@ -1,0 +1,9 @@
+# Management tools only. Python packages are installed into the bind-mounted
+# repo's .runtime/linux-venv, never into the Mac's Python installation.
+FROM docker:29-cli AS dockercli
+FROM python:3.13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+ENV PYTHONDONTWRITEBYTECODE=1

@@ -42,7 +42,9 @@ agentic = [
 ]
 coding = [
     # Terminal-Bench 2.1 / SWE-bench Verified through harbor
-    "harbor>=0.18",
+    "harbor==0.23.0",
+    "litellm==1.103.2",
+    "openai==2.54.0",
 ]
 dev = ["pytest>=7.0"]
 

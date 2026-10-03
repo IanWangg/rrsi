@@ -77,6 +77,11 @@ class Run:
 
     def __init__(self, domain, cfg: RRSIConfig, repo: Path, runs_root: Path):
         self.domain, self.cfg, self.repo = domain, cfg, Path(repo)
+        if domain.name == "coding":
+            from domains.coding.runtime import Runtime
+            runtime = Runtime(self.repo)
+            runtime.inside(runs_root)
+            runtime.activate()
         self.runs = Path(runs_root) / domain.name
         self.jobs = self.runs / "jobs"
         self.wt_root = self.runs / "wt"
@@ -94,7 +99,10 @@ class Run:
     def frontier(self) -> dict:
         if not self.frontier_path.exists():
             raise SystemExit(f"no {self.frontier_path}; run `baseline` first")
-        return json.loads(self.frontier_path.read_text())
+        frontier = json.loads(self.frontier_path.read_text())
+        if hasattr(self.domain, "validate_frontier"):
+            self.domain.validate_frontier(frontier)
+        return frontier
 
     def save_frontier(self, fr: dict) -> None:
         self.frontier_path.write_text(json.dumps(fr, indent=1))
@@ -103,7 +111,10 @@ class Run:
         if self.cfg.delta is not None:
             return float(self.cfg.delta)
         if self.calibration_path.exists():
-            return float(json.loads(self.calibration_path.read_text())["delta"])
+            calibration = json.loads(self.calibration_path.read_text())
+            if hasattr(self.domain, "validate_frontier"):
+                self.domain.validate_frontier(calibration)
+            return float(calibration["delta"])
         raise SystemExit("no noise band: set cfg.delta or run `calibrate`")
 
     def eval_path(self, job: str) -> Path:
@@ -197,6 +208,8 @@ class Run:
               "S_star": ev.S,
               "trajectory": [{"t": 0, "S": ev.S, "C": ev.C, "commit": commit, "job": job}],
               "config": self.cfg.dump()}
+        if hasattr(self.domain, "run_metadata"):
+            fr["coding_policy"] = self.domain.run_metadata()
         self.save_frontier(fr)
         self.history.append({"t": 0, "variant": "-", "edit_id": None, "component": None,
                              "hypothesis": "H_0 baseline", "outcome": "BASELINE",
@@ -207,9 +220,13 @@ class Run:
         return ev
 
     def calibrate(self, jobs: list[str]) -> dict:
+        if hasattr(self.domain, "validate_calibration"):
+            self.domain.validate_calibration(self.runs, jobs)
         evals = [EvalResult.load(self.eval_path(j)) for j in jobs]
         cal = _calibrate(evals, z=self.cfg.delta_z)
         cal["jobs"] = jobs
+        if hasattr(self.domain, "run_metadata"):
+            cal["coding_policy"] = self.domain.run_metadata()
         _write_cal(self.calibration_path, cal)
         log(self.domain.name, f"calibrated delta={cal['delta']:.5f} "
             f"(sd_null {cal['sd_null']:.5f}, z={cal['z']}, {cal['method']})")

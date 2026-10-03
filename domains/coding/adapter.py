@@ -38,11 +38,13 @@ pass; a missing or errored trial counts 0.0 with the full denominator.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
 import sys
 import time
+import signal
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -52,9 +54,50 @@ from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
 import briefs                            # noqa: E402
 import render                            # noqa: E402
+from domains.coding.runtime import Runtime, job_name
+from domains.coding.harbor_entry import POLICY_MAX_TOKENS, agent_kwargs
+from rrsi.deepseek import is_deepseek, settings, redact
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
-PYBIN = os.environ.get("RRSI_CODING_PYTHON", str(HERE / ".venv" / "bin" / "python"))
+
+def source_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    harness = root / "third_party/harbor_terminus2"
+    for path in sorted(harness.rglob("*")):
+        if path.is_file() and path.suffix in {".py", ".txt", ".md", ".json"}:
+            digest.update(str(path.relative_to(harness)).encode() + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def policy_metadata() -> dict:
+    model = os.environ.get("MODEL", CFG["policy_model"])
+    if is_deepseek(model):
+        cfg = settings(require_key=False)
+        return {"model": model, "api_base": cfg.api_base, "reasoning_effort": cfg.reasoning_effort,
+                "request_max_tokens": POLICY_MAX_TOKENS}
+    return {"model": model}
+
+
+def _sample_resources(runtime: Runtime, manifest: Path) -> dict:
+    from domains.coding.docker_resources import resources, docker_env
+    containers = resources(runtime, manifest)["container"]
+    if not containers:
+        return {}
+    result = subprocess.run([runtime.docker(), "stats", "--no-stream", "--format", "{{json .}}",
+                             *containers], capture_output=True, text=True, timeout=15, env=docker_env())
+    if result.returncode:
+        return {}
+    cpu, memory = 0.0, 0.0
+    for line in result.stdout.splitlines():
+        row = json.loads(line)
+        cpu += float(row["CPUPerc"].rstrip("%"))
+        amount = re.match(r"([\d.]+)\s*([A-Za-z]+)", row["MemUsage"].split("/")[0])
+        if amount:
+            scale = {"B": 1/1024**2, "KiB": 1/1024, "MiB": 1, "GiB": 1024,
+                     "kB": 1000/1024**2, "MB": 1000**2/1024**2, "GB": 1000**3/1024**2}
+            memory += float(amount[1]) * scale.get(amount[2], 1)
+    return {"cpu_percent": cpu, "memory_mb": memory}
 
 
 def _load_result(trial_dir: Path) -> dict | None:
@@ -98,6 +141,10 @@ def infra_failure(result: dict) -> bool:
 def _tokens(result: dict) -> int | None:
     if result.get("exception_info"):
         return None
+    return _usage_tokens(result)
+
+
+def _usage_tokens(result: dict) -> int | None:
     ar = result.get("agent_result") or {}
     tok = (ar.get("n_input_tokens") or 0) + (ar.get("n_output_tokens") or 0)
     return tok or None
@@ -151,41 +198,119 @@ class CodingDomain(Domain):
         return list(CFG["smoke_tasks"])
 
     # ---- Evaluate ----------------------------------------------------------
+    def run_metadata(self) -> dict:
+        return policy_metadata()
+
+    def validate_frontier(self, frontier: dict) -> None:
+        if frontier.get("coding_policy") != self.run_metadata():
+            raise RuntimeError("Stored Coding results belong to another/unknown policy; start a new repo-local --runs directory and baseline")
+
+    def validate_calibration(self, runs_dir: Path, jobs: list[str]) -> None:
+        runtime = Runtime()
+        signatures = set()
+        for job in jobs:
+            manifest = runtime.inside(Path(runs_dir) / "manifests" / f"{job_name(job)}.json")
+            if not manifest.exists():
+                raise RuntimeError("Calibration job has unknown policy provenance; run a fresh baseline")
+            data = json.loads(manifest.read_text())
+            if (data.get("policy") != self.run_metadata() or data.get("smoke") is not False
+                    or data.get("dataset") != CFG["dataset"]
+                    or data.get("tasks") != sorted(self._tasks)):
+                raise RuntimeError("Calibration jobs must be full evaluations of the current policy")
+            signatures.add((data.get("harness_sha256"), data.get("k")))
+        if len(signatures) != 1 or any(not digest or not k for digest, k in signatures):
+            raise RuntimeError("Calibration jobs must use the same harness and attempts")
+
     def _harbor(self, root: Path, runs_dir: Path, job: str, ids: list[str] | None,
-                k: int, dataset: str, log_prefix: str) -> None:
-        jobs = runs_dir / "jobs"
+                k: int, dataset: str, log_prefix: str, *, smoke=False) -> int:
+        runtime = Runtime()
+        runtime.activate()
+        root = root.resolve()
+        if root != runtime.repo:
+            runtime.inside(root)
+        runs_dir = runtime.inside(runs_dir)
+        job_name(job)
+        if log_prefix:
+            job_name(log_prefix)
+        jobs = runtime.inside(runs_dir / "jobs")
         jobs.mkdir(parents=True, exist_ok=True)
-        jdir = jobs / job
+        jdir = runtime.inside(jobs / job)
+        policy = policy_metadata()
+        if smoke and is_deepseek(policy["model"]):
+            policy["reasoning_effort"] = "low"
+        expected = {"policy": policy, "dataset": dataset,
+                    "tasks": sorted(ids if ids is not None else self._tasks), "k": k,
+                    "harness_sha256": source_digest(root), "smoke": smoke}
+        manifest = runtime.inside(runs_dir / "manifests" / f"{job}.json")
         if jdir.exists():
+            if not manifest.exists() or json.loads(manifest.read_text()) != expected:
+                raise RuntimeError(f"job {job} has different or unknown provenance; use a new job/runs directory")
             n_have = sum(1 for rj in jdir.glob("*/result.json")
                          if not infra_failure(_load_result(rj.parent) or {}))
             n_want = len(ids if ids is not None else self._tasks) * k
             if n_have >= n_want:
                 print(f"[coding] job {job} already complete ({n_have} trials); not re-running",
                       flush=True)
-                return
+                return 0
             # harbor cannot resume a job; a partial dir (killed run, or an earlier
             # candidate under the same name) would be scored as mostly-missing.
             stale = jdir.with_name(f"{job}.stale.{int(time.time())}")
             jdir.rename(stale)
             print(f"[coding] job {job} was incomplete ({n_have}/{n_want} trials); moved to "
                   f"{stale.name} and re-running from scratch", flush=True)
-        script = root / "domains" / "coding" / "scripts" / "run_eval.sh"
-        cmd = [str(script), job, dataset, str(k), str(CFG.get("concurrency", 10)),
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps(expected, indent=2))
+        # Infrastructure is frozen in the main checkout; only the candidate
+        # harness is imported from its worktree.
+        script = HERE / "scripts" / "run_eval.sh"
+        cmd = [str(script), job, dataset, str(k), str(1 if smoke else CFG.get("concurrency", 1)),
                "--jobs-dir", str(jobs)]
+        if smoke:
+            cmd.append("--smoke")
         if ids is not None and set(ids) != set(self._tasks):
             for t in ids:
                 cmd += ["-i", f"terminal-bench/{t}"]
         env = {**os.environ, "RRSI_CODING_ROOT": str(root / "domains" / "coding"),
-               "RRSI_CODING_VENV": str((HERE / ".venv").resolve()),
-               "MODEL": CFG.get("policy_model", "vertex_ai/gemini-3.5-flash")}
-        log = runs_dir / "logs" / f"{log_prefix or job}.log"
+               "RRSI_CODING_VENV": str(runtime.venv), "RRSI_CODING_PYTHON": str(runtime.python),
+               "MODEL": policy["model"]}
+        if smoke:
+            env["DEEPSEEK_REASONING_EFFORT"] = "low"
+        log = runtime.inside(runs_dir / "logs" / f"{log_prefix or job}.log")
         log.parent.mkdir(parents=True, exist_ok=True)
+        peaks = {"cpu_percent": 0.0, "memory_mb": 0.0, "samples": 0}
+        started = time.monotonic()
         with open(log, "a") as lf:
-            r = subprocess.run(cmd, cwd=str(root / "domains" / "coding"),
-                               stdout=lf, stderr=subprocess.STDOUT, env=env)
-        if r.returncode != 0:
-            print(f"[coding] WARNING harbor rc={r.returncode} (see {log})", flush=True)
+            process = subprocess.Popen(cmd, cwd=str(root / "domains" / "coding"),
+                stdout=lf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+            try:
+                while process.poll() is None:
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            sample = _sample_resources(runtime, jdir / "docker.jsonl")
+                            if sample:
+                                peaks["samples"] += 1
+                                for key in ("cpu_percent", "memory_mb"):
+                                    peaks[key] = max(peaks[key], sample[key])
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                            pass  # telemetry never changes benchmark scoring
+            except BaseException:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                from domains.coding.docker_resources import cleanup
+                cleanup(runtime, jdir / "docker.jsonl")
+                raise
+        (runs_dir / "manifests" / f"{job}.resources.json").write_text(json.dumps(
+            {"elapsed_seconds": round(time.monotonic() - started, 2),
+             "task_container_peaks": peaks, "returncode": process.returncode}, indent=2))
+        if process.returncode != 0:
+            print(f"[coding] WARNING harbor rc={process.returncode} (see {log})", flush=True)
+        return process.returncode
 
     def run(self, root, runs_dir, job, ids, k, log_prefix=""):
         self._harbor(Path(root), Path(runs_dir), job, ids, k, CFG["dataset"], log_prefix)
@@ -251,36 +376,69 @@ class CodingDomain(Domain):
 
     # ---- gates -------------------------------------------------------------
     def smoke(self, root, runs_dir, job, ids):
+        previous = os.environ.get("DEEPSEEK_REASONING_EFFORT")
+        os.environ["DEEPSEEK_REASONING_EFFORT"] = "low"
+        try:
+            return self._smoke(root, runs_dir, job, ids)
+        finally:
+            if previous is None:
+                os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
+            else:
+                os.environ["DEEPSEEK_REASONING_EFFORT"] = previous
+
+    def _smoke(self, root, runs_dir, job, ids):
         root, runs_dir = Path(root), Path(runs_dir)
+        runtime = Runtime()
+        runtime.activate()
         cdir = root / "domains" / "coding"
-        comp = subprocess.run([PYBIN, "-m", "compileall", "-q", str(self.harness_dir(root))],
+        comp = subprocess.run([str(runtime.python), "-m", "compileall", "-q", str(self.harness_dir(root))],
                               capture_output=True, text=True)
         if comp.returncode != 0:
             return False, {"stage": "compile", "detail": (comp.stdout + comp.stderr)[-1500:]}
-        code = ("from pathlib import Path\nfrom harbor_terminus2 import AgentHarness\n"
-                "a = AgentHarness(logs_dir=Path('/tmp/rrsi_ctor_check'), "
-                f"model_name='{CFG.get('policy_model', 'vertex_ai/gemini-3.5-flash')}')\n"
+        ctor_logs = runtime.inside(runs_dir / "logs" / f"{job}_ctor")
+        code = ("from pathlib import Path\n"
+                "from domains.coding.runtime import Runtime, configure_harbor\n"
+                "configure_harbor(Runtime())\nfrom harbor_terminus2 import AgentHarness\n"
+                f"a = AgentHarness(logs_dir=Path({str(ctor_logs)!r}), "
+                f"model_name={policy_metadata()['model']!r}, **{agent_kwargs(policy_metadata()['model'], True)!r})\n"
                 "assert AgentHarness.name() == 'rrsi-terminus2'\nprint('CTOR_OK')\n")
-        ctor = subprocess.run([PYBIN, "-c", code], cwd=str(cdir), capture_output=True,
-                              text=True, env={**os.environ, "PYTHONPATH": str(root / "third_party")})
+        ctor = subprocess.run([str(runtime.python), "-c", code], cwd=str(cdir), capture_output=True,
+            text=True, env={**os.environ, "PYTHONPATH": f"{root / 'third_party'}:{runtime.repo}"})
         if "CTOR_OK" not in ctor.stdout:
             return False, {"stage": "ctor", "detail": (ctor.stderr or ctor.stdout)[-1200:]}
         jdir = runs_dir / "jobs" / job
-        subprocess.run(["rm", "-rf", str(jdir)])
-        self._harbor(root, runs_dir, job, ids, 1, CFG["dataset"], job)
-        found, details = 0, {}
+        rc = self._harbor(root, runs_dir, job, ids, 1, CFG["dataset"], job, smoke=True)
+        found, details, trials = 0, {}, []
+        if rc:
+            details["harbor_returncode"] = rc
         for td in (jdir.glob("*") if jdir.exists() else []):
             res = _load_result(td)
             if res is None:
                 continue
             found += 1
             if res.get("exception_info"):
-                details[td.name] = str(res["exception_info"])[:400]
-        if found < len(ids):
+                error = res["exception_info"]
+                details[td.name] = (f"{error.get('exception_type')}: {error.get('exception_message')}"
+                                    if isinstance(error, dict) else str(error))
+            if _short(res) not in ids or _reward(res) not in (0.0, 1.0) or _usage_tokens(res) is None:
+                details.setdefault(td.name, "missing verifier reward/tokens, or unexpected task")
+            exception = res.get("exception_info")
+            if isinstance(exception, dict):
+                exception = {key: exception.get(key) for key in ("exception_type", "exception_message")}
+            trials.append({"task": _short(res), "reward": _reward(res), "tokens": _usage_tokens(res),
+                           "trial_dir": str(td), "exception": redact(exception)})
+        if found != len(ids):
             details["missing_trials"] = f"{found}/{len(ids)}"
-        if details:
-            return False, {"stage": "smoke_run", **details}
-        return True, {"stage": "smoke_run", "n": found}
+        if {t["task"] for t in trials} != set(ids):
+            details["task_coverage"] = "each requested task must appear exactly once"
+        from domains.coding.docker_resources import resources
+        remaining = resources(runtime, jdir / "docker.jsonl")
+        if any(remaining.values()):
+            details["remaining_resources"] = remaining
+        telemetry = json.loads((runs_dir / "manifests" / f"{job}.resources.json").read_text())
+        report = {"stage": "smoke_run", "n": found, "trials": trials, "policy": policy_metadata(),
+                  "resources": telemetry, "remaining_resources": remaining, "errors": redact(details)}
+        return not details, report
 
 
 DOMAIN = CodingDomain()

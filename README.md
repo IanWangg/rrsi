@@ -65,11 +65,11 @@ pip install -e ".[dev]"            # the search core (Python 3.10 or newer)
 python3 -m pytest tests
 ```
 
-The benchmark runners live in their own environments: harbor for the coding instance (`domains/coding/.venv`), and a Python 3.11 environment with `pip install -e ".[agentic]"` for the workspace and engineering instances (`RRSI_AGENT_PYTHON`).
+The Coding instance uses Python >=3.12, Harbor and local Docker, with a repo-local `.venv` or Docker controller environment (see [Coding setup](domains/coding/README.md)). Workspace and engineering use a Python 3.11 environment with `pip install -e ".[agentic]"` (`RRSI_AGENT_PYTHON`).
 
 ### 1. LLM configuration
 
-The proposer, the analyst, the critic and the frozen policy are Claude Opus 4.8 on Vertex AI (`policy_model` in `domains/coding/rrsi.json`, `ORCHESTRATOR_MODEL` for the other two instances; any LiteLLM model string works). The Harvey LAB judge is Gemini 3.5 Flash.
+Coding now defaults to `deepseek-flash` with low reasoning for all search roles and the frozen policy. Export `DEEPSEEK_API_KEY`; no GCP credentials are needed for Coding. Workspace and engineering retain Claude on Vertex AI (`ORCHESTRATOR_MODEL`); the Harvey LAB judge remains Gemini. The following Vertex setup applies to those instances:
 
 ```bash
 gcloud auth application-default login
@@ -101,8 +101,11 @@ The short version of each:
 
 ```bash
 # coding: Docker + harbor
-python3 -m venv domains/coding/.venv && domains/coding/.venv/bin/pip install "harbor>=0.18"
-python3 rrsi.py --domain coding baseline && python3 rrsi.py --domain coding run
+bash domains/coding/scripts/setup_local.sh                   # Python >=3.12; repo-local .venv
+.venv/bin/python rrsi.py --domain coding preflight
+.venv/bin/python rrsi.py --domain coding smoke --working-tree # two tasks, k=1, concurrency=1
+# After committing the harness you want to evolve, a full run is explicit:
+.venv/bin/python rrsi.py --domain coding baseline && .venv/bin/python rrsi.py --domain coding run
 bash domains/coding/scripts/swe_eval.sh                       # H_0 and the incumbent on SWE-bench Verified
 
 # workspace: a Harvey LAB checkout at the pinned commit; the split is generated from it on first use
